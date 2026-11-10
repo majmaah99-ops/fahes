@@ -1,13 +1,11 @@
 """
 فاحص (FAHES) — نموذج أولي تفاعلي
-تشغيل: streamlit run app.py
+تشغيل: streamlit run streamlit_app.py
 """
 
-import io
 import json
 import numpy as np
 import streamlit as st
-import cv2
 import torch
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
@@ -15,6 +13,7 @@ from transformers import CLIPProcessor, CLIPModel
 # استيراد المنطق من الملفات الخارجية
 from fusion import calculate_risk
 from fhir_export import build_fhir_bundle
+from image_checks import assess_quality
 
 # ─────────────────────── إعداد الصفحة والستايل ───────────────────────
 st.set_page_config(
@@ -118,27 +117,31 @@ with col2:
     
     if uploaded_file is not None:
         # 1. معالجة الصورة وبوابة الجودة
-        img_array = np.array(img)
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        
-        # تطبيع الجودة (تجريبي: قيمة > 500 تعتبر جودة ممتازة)
-        image_quality = float(min(laplacian_var / 500.0, 1.0))
+        # الجودة تُقاس داخل منطقة الشبكية فقط (انظر image_checks.py)
+        quality_info = assess_quality(np.array(img))
+        image_quality = quality_info["quality"]
         
         # 2. تحليل الشبكية باستخدام CLIP
         clip_model, clip_processor = load_clip_model()
         
+        # التصنيف الثالث يلتقط الصور التي ليست صور شبكية أصلًا (قطة، مستند، سيلفي...)
         texts = [
             "a retinal fundus photo showing severe diabetic retinopathy with hemorrhages and exudates",
-            "a normal healthy retinal fundus photo"
+            "a normal healthy retinal fundus photo",
+            "a photo that is not a retinal fundus image",
         ]
         
         inputs = clip_processor(text=texts, images=img, return_tensors="pt", padding=True)
         with torch.no_grad():
-            logits = clip_model(**inputs).logits_per_image.softmax(dim=1)
-            
-        image_score = float(logits[0][0])          # احتمال وجود اعتلال
-        model_confidence = float(max(logits[0]))   # ثقة النموذج
+            probs = clip_model(**inputs).logits_per_image.softmax(dim=1)[0]
+        
+        p_dr, p_normal, p_not_fundus = (float(x) for x in probs)
+        is_fundus = p_not_fundus < 0.5
+        # إعادة التطبيع بين تصنيفي الشبكية فقط
+        image_score = p_dr / max(p_dr + p_normal, 1e-9)   # احتمال وجود اعتلال
+        # ملاحظة: مع تصنيفين تكون max ≥ 0.5 دائمًا؛ هذا وكيل مؤقت للثقة
+        # يُستبدل بثقة معايَرة (temperature scaling) مع نموذج EfficientNet-B3
+        model_confidence = max(image_score, 1 - image_score)
         
         # 3. حساب درجات الساعة الذكية والسجل
         # (منطق تجريبي — يمكن استبداله بنموذج انحدار لوجستي حقيقي)
@@ -148,9 +151,12 @@ with col2:
         sleep_risk = min(max((7 - sleep_h) / 4.0, 0), 1.0)
         wearable_score = float(0.3*hr_risk + 0.3*hrv_risk + 0.2*steps_risk + 0.2*sleep_risk)
         
-        ehr_score = float(min(max(
-            0.4*(dm_years/20.0) + 0.4*((hba1c-6)/6.0) + 0.2*((sbp-120)/60.0), 
-            0), 1))
+        # كل مكوّن يُقصّ إلى [0،1] قبل الجمع حتى لا تُخفض قيمة طبيعية خطرَ مكوّن آخر
+        def clip01(x):
+            return min(max(x, 0.0), 1.0)
+        ehr_score = float(
+            0.4*clip01(dm_years/20.0) + 0.4*clip01((hba1c-6)/6.0) + 0.2*clip01((sbp-120)/60.0)
+        )
         
         # 4. الدمج (استدعاء fusion.py)
         result = calculate_risk(
@@ -158,7 +164,8 @@ with col2:
             image_quality=image_quality,
             model_confidence=model_confidence,
             wearable_score=wearable_score,
-            ehr_score=ehr_score
+            ehr_score=ehr_score,
+            is_fundus=is_fundus,
         )
         
         # 5. عرض النتيجة
@@ -172,13 +179,23 @@ with col2:
         </div>
         """, unsafe_allow_html=True)
         
+        if result["risk_score"] is None:
+            st.warning("⚪ رمادي يعني «لا نعرف» — وليس «سليم». لم تُصدر درجة خطر.")
+        if result.get("partial_signal") is not None:
+            st.info(f"إشارة مساندة من الساعة والسجل فقط: {result['partial_signal']:.2f} "
+                    "— للاسترشاد، لا تغني عن تقييم الشبكية.")
+        
         st.markdown("#### 🔍 الأسباب:")
         for reason in result["reasons"]:
             st.markdown(f'<div class="reason-box">• {reason}</div>', unsafe_allow_html=True)
             
         with st.expander("⚙️ تفاصيل المكونات (للمراجعة)"):
             st.json(result["components"])
-            st.caption(f"جودة الصورة: {image_quality:.2f} | ثقة النموذج: {model_confidence:.2f}")
+            st.caption(
+                f"جودة الصورة: {image_quality:.2f} (تباين {quality_info['laplacian_var']}) | "
+                f"ثقة النموذج: {model_confidence:.2f} | "
+                f"احتمال أنها ليست صورة شبكية: {p_not_fundus:.2f}"
+            )
             
         # 6. مخرجات FHIR والتقرير
         st.markdown("---")
@@ -191,6 +208,7 @@ with col2:
             "hr": hr,
             "steps": steps,
             "hrv": hrv,
+            "sleep_h": sleep_h,
             "image_quality": round(image_quality, 3)
         }
         
