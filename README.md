@@ -57,12 +57,12 @@ python -m unittest discover -s tests -v
 
 > **مهم:** لا يقيس التطبيق قوة النظر، أو HbA1c، ولا يشخّص السكري أو اعتلال الشبكية. **اجتياز بوابة الجودة لا يعني أن العين سليمة**، ولا يثبت أن الملف المرفوع صورة عين أصلًا.
 
-## تشغيل النموذج
+## تشغيل واجهة Streamlit الأصلية (اختياري)
 
-يتطلب Python 3.11 أو نسخة متوافقة:
+يتطلب Python 3.11 أو 3.12:
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-streamlit.txt
 streamlit run streamlit_app.py
 ```
 
