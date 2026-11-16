@@ -1,262 +1,271 @@
-"""
-فاحص (FAHES) — نموذج أولي تفاعلي
-تشغيل: streamlit run streamlit_app.py
-"""
+"""FAHES | Arabic, non-diagnostic photographic eye-screening prototype.
 
+Photo quality is checked technically; medical routing comes ONLY from declared
+symptoms/history. No clinical classifier, refraction estimate or diabetes
+prediction is performed. Streamlit processes uploads on the app server.
+"""
+from __future__ import annotations
+
+import html
 import json
+from io import BytesIO
+
 import numpy as np
 import streamlit as st
-import torch
-from PIL import Image
-from transformers import CLIPProcessor, CLIPModel
+from PIL import Image, ImageOps, UnidentifiedImageError
 
-# استيراد المنطق من الملفات الخارجية
-from fusion import calculate_risk
-from fhir_export import build_fhir_bundle
-from image_checks import assess_quality
+from eye_quality import assess_photo_quality
+from triage import SYMPTOMS, triage
+from triage_export import build_triage_bundle
 
-# ─────────────────────── إعداد الصفحة والستايل ───────────────────────
-st.set_page_config(
-    page_title="فاحص — درجة خطر واحدة",
-    page_icon="👁️",
-    layout="wide",
-)
 
-# دعم اللغة العربية والتصميم
-st.markdown("""
-<style>
+MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_PIXELS = 24_000_000
+PHOTO_OPTIONS = {
+    "صورة مقدمة العين بكاميرا الجوال": "external",
+    "صورة قاع العين باستخدام ملحق بصري": "fundus",
+}
+
+st.set_page_config(page_title="فاحص | فرز أعراض العين", page_icon="👁️", layout="wide")
+st.markdown(
+    """
+    <style>
     @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Tajawal', sans-serif;
-        direction: rtl;
-        text-align: right;
-    }
-    
-    .risk-card {
-        padding: 2rem;
-        border-radius: 1rem;
-        color: white;
-        text-align: center;
-        margin-bottom: 1rem;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    }
-    .risk-green  { background-color: #2E7D32; }
-    .risk-yellow { background-color: #F9A825; color: #000; }
-    .risk-red    { background-color: #C62828; }
-    .risk-gray   { background-color: #616161; }
-    
-    .risk-score  { font-size: 4rem; font-weight: 700; margin: 0; line-height: 1.2; }
-    .risk-label  { font-size: 1.2rem; margin-top: 0.5rem; }
-    
-    .reason-box  {
-        padding: 0.75rem 1rem;
-        background: #F5F7FA;
-        border-right: 4px solid #1B9AAA;
-        margin-bottom: 0.5rem;
-        border-radius: 0.5rem;
-        font-size: 1.1rem;
-    }
-    
-    .stButton>button {
-        background-color: #1B9AAA;
-        color: white;
-        border-radius: 8px;
-        font-family: 'Tajawal', sans-serif;
-        font-weight: bold;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ─────────────────────── تحميل نموذج CLIP ───────────────────────
-@st.cache_resource(show_spinner="جاري تحميل نموذج تحليل الشبكية...")
-def load_clip_model():
-    model_name = "openai/clip-vit-base-patch32"
-    model = CLIPModel.from_pretrained(model_name)
-    processor = CLIPProcessor.from_pretrained(model_name)
-    return model, processor
-
-# ─────────────────────── واجهة المستخدم: الشريط الجانبي ───────────────────────
-with st.sidebar:
-    st.image("https://img.icons8.com/color/96/000000/eye-care.png", width=80)
-    st.title("بيانات المريض")
-    
-    with st.expander("👤 معلومات أساسية", expanded=True):
-        name = st.text_input("اسم المريض", "خالد")
-        age = st.number_input("العمر", min_value=1, max_value=120, value=52)
-        gender = st.selectbox("الجنس", ["ذكر", "أنثى"])
-        
-    with st.expander("🏥 السجل السريري", expanded=True):
-        dm_years = st.number_input("سنوات الإصابة بالسكري", min_value=0, max_value=50, value=7)
-        hba1c = st.slider("مستوى HbA1c (%)", min_value=4.0, max_value=15.0, value=8.5, step=0.1)
-        sbp = st.number_input("ضغط الدم الانقباضي (mmHg)", min_value=80, max_value=220, value=145)
-        
-    with st.expander("⌚ بيانات الساعة الذكية", expanded=True):
-        hr = st.number_input("متوسط النبض (نبضة/دقيقة)", min_value=30, max_value=200, value=82)
-        hrv = st.number_input("تقلب معدل النبض HRV (ms)", min_value=5, max_value=150, value=28)
-        steps = st.number_input("عدد الخطوات اليومية", min_value=0, max_value=50000, value=3200)
-        sleep_h = st.slider("ساعات النوم", min_value=2.0, max_value=12.0, value=5.2, step=0.1)
-
-# ─────────────────────── واجهة المستخدم: الصفحة الرئيسية ───────────────────────
-st.title("👁️ فاحص")
-st.markdown("### درجة خطر واحدة، مفسَّرة بالعربية")
-st.markdown("---")
-
-col1, col2 = st.columns([1, 1], gap="large")
-
-with col1:
-    st.subheader("🖼️ صورة قاع العين")
-    uploaded_file = st.file_uploader("ارفع صورة قاع العين (JPG, PNG)", type=["jpg", "jpeg", "png"])
-    
-    if uploaded_file is not None:
-        img = Image.open(uploaded_file).convert("RGB")
-        st.image(img, caption="الصورة المرفوعة", use_column_width=True)
-
-with col2:
-    st.subheader("📊 نتيجة التحليل")
-    
-    if uploaded_file is not None:
-        # 1. معالجة الصورة وبوابة الجودة
-        # الجودة تُقاس داخل منطقة الشبكية فقط (انظر image_checks.py)
-        quality_info = assess_quality(np.array(img))
-        image_quality = quality_info["quality"]
-        
-        # 2. تحليل الشبكية باستخدام CLIP
-        clip_model, clip_processor = load_clip_model()
-        
-        # التصنيف الثالث يلتقط الصور التي ليست صور شبكية أصلًا (قطة، مستند، سيلفي...)
-        texts = [
-            "a retinal fundus photo showing severe diabetic retinopathy with hemorrhages and exudates",
-            "a normal healthy retinal fundus photo",
-            "a photo that is not a retinal fundus image",
-        ]
-        
-        inputs = clip_processor(text=texts, images=img, return_tensors="pt", padding=True)
-        with torch.no_grad():
-            probs = clip_model(**inputs).logits_per_image.softmax(dim=1)[0]
-        
-        p_dr, p_normal, p_not_fundus = (float(x) for x in probs)
-        is_fundus = p_not_fundus < 0.5
-        # إعادة التطبيع بين تصنيفي الشبكية فقط
-        image_score = p_dr / max(p_dr + p_normal, 1e-9)   # احتمال وجود اعتلال
-        # ملاحظة: مع تصنيفين تكون max ≥ 0.5 دائمًا؛ هذا وكيل مؤقت للثقة
-        # يُستبدل بثقة معايَرة (temperature scaling) مع نموذج EfficientNet-B3
-        model_confidence = max(image_score, 1 - image_score)
-        
-        # 3. حساب درجات الساعة الذكية والسجل
-        # (منطق تجريبي — يمكن استبداله بنموذج انحدار لوجستي حقيقي)
-        hr_risk = min(abs(hr - 75) / 50.0, 1.0)
-        hrv_risk = min(max((40 - hrv) / 40.0, 0), 1.0)
-        steps_risk = min(max((8000 - steps) / 8000.0, 0), 1.0)
-        sleep_risk = min(max((7 - sleep_h) / 4.0, 0), 1.0)
-        wearable_score = float(0.3*hr_risk + 0.3*hrv_risk + 0.2*steps_risk + 0.2*sleep_risk)
-        
-        # كل مكوّن يُقصّ إلى [0،1] قبل الجمع حتى لا تُخفض قيمة طبيعية خطرَ مكوّن آخر
-        def clip01(x):
-            return min(max(x, 0.0), 1.0)
-        ehr_score = float(
-            0.4*clip01(dm_years/20.0) + 0.4*clip01((hba1c-6)/6.0) + 0.2*clip01((sbp-120)/60.0)
-        )
-        
-        # 4. الدمج (استدعاء fusion.py)
-        result = calculate_risk(
-            image_score=image_score,
-            image_quality=image_quality,
-            model_confidence=model_confidence,
-            wearable_score=wearable_score,
-            ehr_score=ehr_score,
-            is_fundus=is_fundus,
-        )
-        
-        # 5. عرض النتيجة
-        color_class = f"risk-{result['color']}"
-        score_display = f"{result['risk_score']:.2f}" if result["risk_score"] is not None else "—"
-        
-        st.markdown(f"""
-        <div class="risk-card {color_class}">
-            <div class="risk-score">{score_display}</div>
-            <div class="risk-label">{result['message']}</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        if result["risk_score"] is None:
-            st.warning("⚪ رمادي يعني «لا نعرف» — وليس «سليم». لم تُصدر درجة خطر.")
-        if result.get("partial_signal") is not None:
-            st.info(f"إشارة مساندة من الساعة والسجل فقط: {result['partial_signal']:.2f} "
-                    "— للاسترشاد، لا تغني عن تقييم الشبكية.")
-        
-        st.markdown("#### 🔍 الأسباب:")
-        for reason in result["reasons"]:
-            st.markdown(f'<div class="reason-box">• {reason}</div>', unsafe_allow_html=True)
-            
-        with st.expander("⚙️ تفاصيل المكونات (للمراجعة)"):
-            st.json(result["components"])
-            st.caption(
-                f"جودة الصورة: {image_quality:.2f} (تباين {quality_info['laplacian_var']}) | "
-                f"ثقة النموذج: {model_confidence:.2f} | "
-                f"احتمال أنها ليست صورة شبكية: {p_not_fundus:.2f}"
-            )
-            
-        # 6. مخرجات FHIR والتقرير
-        st.markdown("---")
-        st.subheader("📄 المخرجات والتكامل")
-        
-        patient_info = {
-            "name": name,
-            "gender": "male" if gender == "ذكر" else "female",
-            "birth_date": f"{2026 - age}-01-01",
-            "hr": hr,
-            "steps": steps,
-            "hrv": hrv,
-            "sleep_h": sleep_h,
-            "image_quality": round(image_quality, 3)
-        }
-        
-        fhir_bundle = build_fhir_bundle(result, patient_info)
-        
-        # تقرير Markdown
-        report_md = f"""# تقرير فاحص
-**المريض:** {name} · **العمر:** {age}
-**النتيجة:** {score_display} ({result['color_ar']})
-**الرسالة:** {result['message']}
-
-## الأسباب
-{chr(10).join('- ' + r for r in result['reasons'])}
-
-## المكونات
-- درجة الصورة: {result['components'].get('image')}
-- درجة الساعة: {result['components'].get('wearable')}
-- درجة السجل: {result['components'].get('ehr')}
-
----
-*أداة دعم قرار — لا تُصدر تشخيصًا. الطبيب المختص هو المرجع.*
-"""
-        
-        btn_col1, btn_col2 = st.columns(2)
-        with btn_col1:
-            st.download_button(
-                label="📥 تنزيل FHIR JSON",
-                data=json.dumps(fhir_bundle, ensure_ascii=False, indent=2),
-                file_name=f"fahes_fhir_{name}.json",
-                mime="application/json",
-                use_container_width=True
-            )
-        with btn_col2:
-            st.download_button(
-                label="📋 تنزيل التقرير (Markdown)",
-                data=report_md.encode("utf-8"),
-                file_name=f"fahes_report_{name}.md",
-                mime="text/markdown",
-                use_container_width=True
-            )
-
-    else:
-        st.info("👈 يرجى رفع صورة قاع العين للبدء في التحليل.")
-
-# ─────────────────────── تذييل الصفحة ───────────────────────
-st.markdown("---")
-st.caption(
-    "⚠️ نموذج أولي لأغراض هاكاثون نبض الابتكار. "
-    "الصور من بيانات APTOS المفتوحة. "
-    "نموذج الشبكية (CLIP) ليس معتمدًا سريريًا — النموذج الحقيقي (EfficientNet-B3) جاهز للاستبدال."
+    html, body, [class*="css"] {font-family:'Tajawal',sans-serif; direction:rtl; text-align:right;}
+    h1,h2,h3 {font-family:'Tajawal',sans-serif;}
+    .block-container {max-width:1120px; padding-top:1.5rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
+
+
+def decode_image(payload: bytes) -> Image.Image:
+    if len(payload) > MAX_FILE_BYTES:
+        raise ValueError("حجم الملف أكبر من 10 ميجابايت.")
+    if not payload:
+        raise ValueError("لم يتم استلام صورة.")
+    try:
+        with Image.open(BytesIO(payload)) as source:
+            if source.width * source.height > MAX_PIXELS:
+                raise ValueError("دقة الصورة كبيرة جدًا؛ الحد الأقصى 24 مليون بكسل.")
+            if source.format not in {"JPEG", "PNG", "WEBP"}:
+                raise ValueError("صيغة الصورة غير مدعومة؛ استخدم JPG أو PNG أو WebP.")
+            return ImageOps.exif_transpose(source).convert("RGB")
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("تعذر فتح الصورة؛ أعد حفظها بصيغة JPG أو PNG.") from exc
+
+
+def parse_age(value: str):
+    if not value.strip():
+        return None
+    try:
+        years = int(value.strip())
+    except ValueError as exc:
+        raise ValueError("العمر يجب أن يكون رقمًا صحيحًا.") from exc
+    if years < 1 or years > 120:
+        raise ValueError("أدخل عمرًا بين 1 و120 سنة، أو اترك الحقل فارغًا.")
+    return years
+
+
+def report_markdown(result: dict, quality: dict, age, declared_type: str) -> str:
+    lines = [
+        "# فاحص — تقرير توجيه أولي تجريبي",
+        "",
+        "**تنبيه:** ليس تشخيصًا، ولا تقديرًا لاحتمال السكري أو اعتلال الشبكية.",
+        f"**نوع الصورة المُعلن من المستخدم:** {declared_type}",
+        f"**العمر:** {age if age is not None else 'غير مدخل'}",
+        f"**أولوية التوجيه بناءً على الاستبيان:** {result['title']}",
+        "",
+        "## التوصية",
+        result["action"],
+        "",
+        "## البيانات المبلّغ عنها",
+        *["- " + reason for reason in result["reasons"]],
+        "",
+        "## الفحص التقني للصورة",
+        f"- نتيجة فحص الجودة التجريبي: {'استوفت العتبات' if quality['ok'] else 'تحتاج إعادة التصوير'}",
+        f"- المتوسط التقريبي للإضاءة: {quality['brightness']}/255",
+        f"- تباين حواف الصورة (مؤشر حدة غير سريري): {quality['sharpness']}",
+        *["- ملاحظة: " + msg for msg in quality["warnings"]],
+        "",
+        "## حدود التحليل",
+        result["image_note"],
+        "فحص الجودة لا يتأكد من وجود عين بالصورة أو خلوها من الأمراض. لم يُطبق نموذج تشخيصي.",
+        "الرفع عبر Streamlit يُعالَج على خادم التطبيق، وليس داخل الهاتف فقط.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def report_html(result: dict, quality: dict, age, declared_type: str) -> str:
+    """Standalone printable HTML, suitable for browser Print > Save as PDF."""
+    escape = lambda value: html.escape(str(value), quote=True)
+    reasons = "".join("<li>" + escape(x) + "</li>" for x in result["reasons"])
+    warnings = "".join("<li>" + escape(x) + "</li>" for x in quality["warnings"])
+    state = "استوفت العتبات التقنية" if quality["ok"] else "تحتاج إعادة تصوير"
+    return f"""<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<title>تقرير فاحص التجريبي</title><style>
+body{{font-family:Tahoma,Arial,sans-serif;max-width:800px;margin:32px auto;color:#192b3b;line-height:1.8;padding:0 18px}}
+h1{{color:#126079}}.note{{border-right:4px solid #c67b00;background:#fff7ed;padding:12px}}
+.box{{border:1px solid #d8e3e8;border-radius:10px;padding:14px;margin:16px 0}}
+@media print{{body{{margin:10mm auto}}}}
+</style></head><body><h1>فاحص | تقرير توجيه أولي</h1>
+<p class="note"><strong>بحثي وغير تشخيصي.</strong> لا يقيس النظر أو HbA1c ولا يتحقق من أمراض الشبكية.</p>
+<div class="box"><p><b>الصورة المُعلنة:</b> {escape(declared_type)}</p>
+<p><b>العمر:</b> {escape(age if age is not None else "غير مدخل")}</p>
+<p><b>أولوية التوجيه:</b> {escape(result['title'])}</p>
+<p><b>التوصية:</b> {escape(result['action'])}</p></div>
+<h2>المعلومات المُبلّغ عنها</h2><ul>{reasons}</ul>
+<h2>جودة الصورة التقنية (تجريبية)</h2>
+<p>{state} | الإضاءة: {quality['brightness']}/255 | مؤشر الحدة: {quality['sharpness']}</p>
+<ul>{warnings}</ul>
+<h2>حدود التحليل</h2><p>{escape(result['image_note'])}</p>
+<p>الصورة لا تُدرج داخل التقرير. لا تمثل النتيجة إحالة صادرة عن منشأة صحية.</p>
+</body></html>"""
+
+
+st.title("👁️ فاحص | FAHES")
+st.subheader("التصوير بالجوال وفرز أعراض العين — نموذج أولي")
+st.warning(
+    "هذا التطبيق لا يشخّص السكري أو اعتلال الشبكية، ولا يقيس قوة النظر. "
+    "تحليل الصورة هنا تقني (إضاءة وحدّة)، أما التوجيه فيعتمد على الأعراض التي تدخلها. "
+    "عند فقدان مفاجئ للنظر أو ألم شديد أو إصابة، اطلب المساعدة الطبية العاجلة دون انتظار الصورة."
+)
+st.caption(
+    "الخصوصية: تُرسل الصور إلى خادم Streamlit لمعالجتها أثناء الجلسة. "
+    "لا يحفظ التطبيق الصور في قاعدة بيانات ولا يرسلها لخدمات ذكاء اصطناعي خارجية. "
+    "تجنب رفع بيانات تعريفية غير لازمة، ولا تستخدمه على بيانات مرضى حقيقية دون الموافقات والضوابط اللازمة."
+)
+
+image_col, form_col = st.columns([1.05, 1], gap="large")
+with image_col:
+    st.markdown("### ١ — التقاط الصورة وفحص الجودة")
+    selected_label = st.radio("نوع الصورة (حدده يدويًا)", list(PHOTO_OPTIONS), horizontal=False)
+    image_type = PHOTO_OPTIONS[selected_label]
+    if image_type == "external":
+        st.info("كاميرا الجوال العادية تصور الجزء الخارجي من العين فقط؛ لا تُظهر الشبكية.")
+    else:
+        st.info("تحتاج صورة قاع العين إلى ملحق تصوير مناسب أو كاميرا مخصصة. اختيار النوع لا يتحقق من محتوى الصورة.")
+    capture_mode = st.radio("مصدر الصورة", ["رفع صورة", "التقاط بالكاميرا"], horizontal=True)
+    if capture_mode == "التقاط بالكاميرا":
+        uploaded = st.camera_input("التقط صورة العين", key="live_capture")
+    else:
+        uploaded = st.file_uploader(
+            "ارفع صورة العين (JPG أو PNG أو WebP)",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="uploaded_eye",
+        )
+
+    quality = None
+    if uploaded is not None:
+        try:
+            photo = decode_image(uploaded.getvalue())
+            st.image(photo, caption="معاينة الصورة (غير محللة طبيًا)", use_column_width=True)
+            quality = assess_photo_quality(np.asarray(photo), image_type)
+            a, b = st.columns(2)
+            a.metric("الإضاءة التقريبية", f"{quality['brightness']}/255")
+            b.metric("مؤشر الحدة", f"{quality['sharpness']:.0f}")
+            if quality["ok"]:
+                st.success("الصورة اجتازت عتبات الجودة التقنية التجريبية، ولا يعني ذلك صلاحيتها للتشخيص.")
+            else:
+                for warning in quality["warnings"]:
+                    st.warning(warning)
+            with st.expander("تفاصيل قياس جودة الصورة"):
+                st.json(quality)
+                st.caption("العتبات غير معايرة على أجهزة أو صور سريرية، ولا تتحقق من أن الصورة تُظهر عينًا.")
+        except ValueError as exc:
+            st.error(str(exc))
+        except Exception:
+            st.error("تعذرت معالجة الصورة. جرّب صورة أخرى.")
+    else:
+        st.info("يمكن البدء باستبيان الأعراض حتى دون صورة، لأن أعراض الطوارئ أهم من نتيجة التصوير.")
+
+with form_col:
+    st.markdown("### ٢ — استبيان الأعراض")
+    st.caption("هذه الإجابات للتوجيه العام، وليست أداة تقدير احتمال مرض.")
+    selected_symptoms = st.multiselect(
+        "حدد الأعراض التي تنطبق (إن وُجدت)",
+        options=list(SYMPTOMS),
+        format_func=lambda code: SYMPTOMS[code],
+        placeholder="اختر الأعراض أو اترك الحقل فارغًا",
+    )
+    diabetes_answer = st.radio(
+        "هل شُخّصت سابقًا بالسكري؟",
+        ["لا أرغب بالإجابة", "نعم", "لا"],
+        horizontal=True,
+    )
+    has_diabetes = diabetes_answer == "نعم"
+    age_string = st.text_input("العمر (اختياري)", placeholder="مثال: 42")
+    st.caption("لا يلزم إدخال اسم أو رقم هوية لإصدار التقرير.")
+
+    try:
+        age = parse_age(age_string)
+    except ValueError as exc:
+        age = None
+        st.error(str(exc))
+
+st.divider()
+st.markdown("### ٣ — نتيجة توجيه أولي")
+result = triage(
+    selected_symptoms,
+    has_diabetes=has_diabetes,
+    image_quality_ok=bool(quality and quality["ok"]),
+    image_type=image_type,
+)
+if result["priority"] == "urgent":
+    st.error("**" + result["title"] + "** — " + result["action"])
+elif result["priority"] == "appointment":
+    st.warning("**" + result["title"] + "** — " + result["action"])
+else:
+    st.info("**" + result["title"] + "** — " + result["action"])
+
+if result["needs_retake"]:
+    st.caption("ملاحظة التصوير: " + (
+        "لم تُرفع صورة بعد؛ " if uploaded is None else "لم تجتز الصورة فحص الجودة؛ "
+    ) + "يمكن تحسين الصورة وإعادة الالتقاط، لكن لا تؤخر طلب المساعدة عند وجود أعراض طارئة.")
+else:
+    st.caption("اجتازت الصورة العتبات التقنية فقط؛ لا تدل النتيجة على سلامة العين.")
+st.caption(result["image_note"])
+
+with st.expander("لماذا ظهرت هذه التوصية؟"):
+    for reason in result["reasons"]:
+        st.write("• " + reason)
+    st.write("لا يُستنتج التشخيص أو درجة خطورة عددية من صورة العين في هذه النسخة.")
+
+if quality is not None and (age_string.strip() == "" or age is not None):
+    st.markdown("### ٤ — تنزيل التقرير والتكامل التجريبي")
+    markdown = report_markdown(result, quality, age, selected_label)
+    exported = build_triage_bundle(
+        result, quality, age=age, symptoms=selected_symptoms
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.download_button(
+        "تنزيل التقرير (Markdown)",
+        data=markdown.encode("utf-8"), file_name="fahes_report.md",
+        mime="text/markdown", use_container_width=True,
+    )
+    c2.download_button(
+        "تنزيل نسخة للطباعة (HTML)",
+        data=report_html(result, quality, age, selected_label).encode("utf-8"),
+        file_name="fahes_report.html", mime="text/html",
+        use_container_width=True,
+    )
+    c3.download_button(
+        "تنزيل FHIR تجريبي (JSON)",
+        data=json.dumps(exported, ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name="fahes_fhir.json", mime="application/fhir+json",
+        use_container_width=True,
+    )
+    st.caption("لفظ «FHIR تجريبي» يعني صيغة تبادل معلومات أولية، ولا يُعد تقريرًا تشخيصيًا.")
+else:
+    st.caption("رفع صورة مستوفية للقراءة وبيانات صحيحة يتيح تنزيل تقرير النتائج التقنية والتوجيه.")
+
+st.divider()
+with st.expander("عن النموذج الأولي وخارطة التحقق"):
+    st.markdown(
+        "• لا يُشغَّل CLIP لتشخيص اعتلال الشبكية؛ النموذج السابق غير معتمد لهذا الغرض.\n"
+        "• لا توجد دقة سريرية أو حساسية ونوعية مثبتة في هذه النسخة.\n"
+        "• فحص الجوال الخارجي منفصل عن تصوير قاع العين بملحق بصري.\n"
+        "• قبل أي استخدام سريري: يلزم نموذج مناسب، مجموعة تحقق مستقلة، "
+        "تحليل حساسية ونوعية، ومراجعة المتطلبات التنظيمية وحماية البيانات."
+    )
