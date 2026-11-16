@@ -1,0 +1,4 @@
+# Optional dependencies for the original Streamlit interface and local tests.
+-r requirements.txt
+streamlit==1.38.0
+httpx==0.28.1
