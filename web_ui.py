@@ -129,7 +129,7 @@ PAGE = r'''<!doctype html>
    <button class="btn primary" id="capture" type="button">التقاط الآن</button>
    <button class="btn" id="camera-stop" type="button">إلغاء الكاميرا</button>
   </div>
-  <p class="hint">الصور تُرسل إلى خادم التطبيق مؤقتًا لفحص الجودة ولا تُحفظ في قاعدة بيانات. لا ترفع صورًا تحتوي على معلومات شخصية إضافية.</p>
+  <p class="hint">الصور تُرسل إلى خادم التطبيق مؤقتًا لفحص الجودة ولا تُحفظ في قاعدة بيانات. الصور الأكبر من 4 ميجابايت تُصغّر في المتصفح لتوافق حد Vercel، وقد تتغير مؤشرات جودة الصورة بسبب الضغط.</p>
  </section>
  <section class="card" aria-labelledby="symptoms-title">
   <h2 id="symptoms-title"><span class="step">٢</span> استبيان الأعراض</h2>
@@ -199,6 +199,32 @@ function showPreview(file){
  $("preview-empty").classList.add("hidden");$("photo-clear").classList.remove("hidden");
  $("result").classList.add("hidden");
 }
+// Vercel Functions reject request bodies above 4.5 MB. Resize oversized
+// images in the browser without sending the original or storing it remotely.
+// The result is only used for experimental *technical* quality screening.
+async function prepareForUpload(file){
+ const maxBytes=4*1024*1024;
+ if(file.size<=maxBytes)return file;
+ let bitmap;
+ try{bitmap=await createImageBitmap(file);}
+ catch(e){throw Error("تعذرت معالجة الصورة الكبيرة؛ اختر نسخة JPG أصغر من 4 ميجابايت.");}
+ try{
+  let limit=1600,quality=0.82,compressed=null;
+  for(let attempt=0;attempt<5;attempt++){
+   const scale=Math.min(1,limit/Math.max(bitmap.width,bitmap.height));
+   const canvas=document.createElement("canvas");
+   canvas.width=Math.max(1,Math.round(bitmap.width*scale));
+   canvas.height=Math.max(1,Math.round(bitmap.height*scale));
+   canvas.getContext("2d").drawImage(bitmap,0,0,canvas.width,canvas.height);
+   compressed=await new Promise(resolve=>canvas.toBlob(resolve,"image/jpeg",quality));
+   if(compressed && compressed.size<=maxBytes){
+    return new File([compressed],"eye-upload-compressed.jpg",{type:"image/jpeg"});
+   }
+   quality=Math.max(0.5,quality-0.09);limit=Math.max(900,Math.round(limit*0.82));
+  }
+  throw Error("تعذّر تصغير الصورة إلى حجم مناسب لـVercel؛ اختر صورة أصغر.");
+ }finally{bitmap.close?.();}
+}
 $("upload").addEventListener("change",e=>{
  const file=e.target.files?.[0];if(!file)return;
  if(!["image/jpeg","image/png","image/webp"].includes(file.type)){feedback("يرجى اختيار صورة JPG أو PNG أو WebP.");return;}
@@ -249,11 +275,18 @@ $("submit").addEventListener("click",async()=>{
  form.append("image_type",document.querySelector('input[name="image_type"]:checked').value);
  form.append("symptoms",JSON.stringify(Array.from(document.querySelectorAll('#symptoms input:checked')).map(el=>el.value)));
  form.append("has_diabetes",String($("diabetes").value==="yes"));form.append("age",age);
- if(currentFile)form.append("file",currentFile,currentFile.name);
  $("submit").disabled=true;$("progress").classList.remove("hidden");$("feedback").classList.add("hidden");
  try{
+  if(currentFile){
+   const resized=await prepareForUpload(currentFile);
+   form.append("file",resized,resized.name);
+  }
   const response=await fetch("/api/screen",{method:"POST",body:form,headers:{"Accept":"application/json"}});
-  const body=await response.json();
+  let body;
+  try{body=await response.json();}
+  catch(e){
+   throw Error(response.status===413?"حجم الصورة أكبر من الحد المسموح؛ جرّب صورة أصغر.":"خدمة التحليل غير متاحة حاليًا. حاول مرة أخرى.");
+  }
   if(!response.ok){const d=body.detail;throw Error(typeof d==="string"?d:"تعذر إتمام تحليل البيانات.");}
   last=body;render(body);
   $("result").classList.remove("hidden");
