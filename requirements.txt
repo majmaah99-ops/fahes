@@ -1,4 +1,6 @@
-streamlit==1.38.0
+# Lean runtime for Vercel: no Streamlit/PyArrow dependency in the deployed Function.
+fastapi==0.115.12
+python-multipart==0.0.20
 pillow==10.4.0
 numpy==1.26.4
 opencv-python-headless==4.10.0.84
