@@ -1,7 +1,7 @@
-name: Python smoke and safety tests
+name: Python application and safety tests
 on:
   push:
-    branches: [main, feature/safe-eye-photo-triage]
+    branches: [main, feature/safe-eye-photo-triage, fix/vercel-fastapi-entrypoint]
   pull_request:
     branches: [main]
 
@@ -12,11 +12,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: pip
-      - name: Install requirements
-        run: python -m pip install -r requirements.txt
-      - name: Syntax validation
-        run: python -m compileall -q streamlit_app.py triage.py eye_quality.py triage_export.py fusion.py fhir_export.py
-      - name: Unit tests
+          cache-dependency-path: |
+            requirements.txt
+            requirements-streamlit.txt
+      - name: Install all test dependencies
+        run: python -m pip install -r requirements-streamlit.txt
+      - name: Validate Python syntax
+        run: python -m compileall -q app.py web_ui.py streamlit_app.py triage.py eye_quality.py triage_export.py fusion.py fhir_export.py
+      - name: Check Python unit and web app smoke tests
         run: python -m unittest discover -s tests -v

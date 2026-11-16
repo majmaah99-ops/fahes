@@ -38,6 +38,18 @@ class TriageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             triage(["something_else"])
 
+    def test_no_photo_is_missing_not_a_passing_quality_result(self):
+        result = triage(["sudden_loss"], image_quality_ok=False)
+        bundle = build_triage_bundle(result, None, age=None, symptoms=["sudden_loss"])
+        obs = next(e["resource"] for e in bundle["entry"]
+                   if e["resource"]["resourceType"] == "Observation")
+        self.assertIn("dataAbsentReason", obs)
+        self.assertNotIn("valueBoolean", obs)
+        self.assertEqual(result["priority"], "urgent")
+        self.assertNotIn("RiskAssessment", [
+            e["resource"]["resourceType"] for e in bundle["entry"]
+        ])
+
     def test_fhir_has_no_fake_disease_probability(self):
         result = triage(["blur"], image_quality_ok=True)
         photo = assess_photo_quality(np.full((400, 400, 3), 125, dtype=np.uint8), "external")
