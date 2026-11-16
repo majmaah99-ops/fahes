@@ -34,13 +34,25 @@ def build_triage_bundle(triage_result, quality, *, age=None, name="", symptoms=(
         "resourceType": "Observation", "id": qid, "status": "preliminary",
         "code": {"text": "Experimental technical photograph quality gate"},
         "subject": {"reference": "urn:uuid:" + pid}, "effectiveDateTime": now,
-        "valueBoolean": bool(quality["ok"]),
-        "note": [{"text": (
+    }
+    if quality is None:
+        # The questionnaire may still trigger urgent guidance without an image.
+        # Never treat a missing image or unchecked quality as a passing score.
+        obs["dataAbsentReason"] = {
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/data-absent-reason",
+                "code": "not-performed",
+                "display": "Not Performed",
+            }],
+            "text": "لم تُرفع صورة؛ لم تُقَس جودة الصورة",
+        }
+    else:
+        obs["valueBoolean"] = bool(quality["ok"])
+        obs["note"] = [{"text": (
             "Technical photo quality only; anatomy and disease not assessed. "
             "Blur variance: " + str(quality["sharpness"]) +
             "; brightness: " + str(quality["brightness"])
-        )}],
-    }
+        )}]
     comm = {
         "resourceType": "Communication", "id": cid, "status": "completed",
         "subject": {"reference": "urn:uuid:" + pid}, "sent": now,
