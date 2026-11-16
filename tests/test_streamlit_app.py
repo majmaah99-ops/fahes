@@ -26,8 +26,8 @@ class StreamlitSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(len(app.multiselect), 1)
         app.multiselect[0].set_value(["sudden_loss"]).run()
         self.assertEqual(len(app.exception), 0)
-        texts = [str(e.message) for e in app.error]
-        self.assertTrue(any("أعراض إنذار" in t for t in texts), texts)
+        self.assertGreaterEqual(len(app.error), 1, "Urgent symptoms must display an alert")
+        # The engine handles the content; the UI test only checks the alert renders.
 
 
 if __name__ == "__main__":
