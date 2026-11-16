@@ -68,7 +68,16 @@ def parse_age(value: str):
     return years
 
 
-def report_markdown(result: dict, quality: dict, age, declared_type: str) -> str:
+def report_markdown(result: dict, quality: dict | None, age, declared_type: str) -> str:
+    if quality is None:
+        image_lines = ["- لا توجد صورة مرفوعة؛ لم يُجرَ فحص جودة الصورة."]
+    else:
+        image_lines = [
+            f"- نتيجة فحص الجودة التجريبي: {'استوفت العتبات' if quality['ok'] else 'تحتاج إعادة التصوير'}",
+            f"- المتوسط التقريبي للإضاءة: {quality['brightness']}/255",
+            f"- تباين حواف الصورة (مؤشر حدة غير سريري): {quality['sharpness']}",
+            *["- ملاحظة: " + msg for msg in quality["warnings"]],
+        ]
     lines = [
         "# فاحص — تقرير توجيه أولي تجريبي",
         "",
@@ -84,10 +93,7 @@ def report_markdown(result: dict, quality: dict, age, declared_type: str) -> str
         *["- " + reason for reason in result["reasons"]],
         "",
         "## الفحص التقني للصورة",
-        f"- نتيجة فحص الجودة التجريبي: {'استوفت العتبات' if quality['ok'] else 'تحتاج إعادة التصوير'}",
-        f"- المتوسط التقريبي للإضاءة: {quality['brightness']}/255",
-        f"- تباين حواف الصورة (مؤشر حدة غير سريري): {quality['sharpness']}",
-        *["- ملاحظة: " + msg for msg in quality["warnings"]],
+        *image_lines,
         "",
         "## حدود التحليل",
         result["image_note"],
@@ -97,12 +103,18 @@ def report_markdown(result: dict, quality: dict, age, declared_type: str) -> str
     return "\n".join(lines) + "\n"
 
 
-def report_html(result: dict, quality: dict, age, declared_type: str) -> str:
+def report_html(result: dict, quality: dict | None, age, declared_type: str) -> str:
     """Standalone printable HTML, suitable for browser Print > Save as PDF."""
     escape = lambda value: html.escape(str(value), quote=True)
     reasons = "".join("<li>" + escape(x) + "</li>" for x in result["reasons"])
-    warnings = "".join("<li>" + escape(x) + "</li>" for x in quality["warnings"])
-    state = "استوفت العتبات التقنية" if quality["ok"] else "تحتاج إعادة تصوير"
+    if quality is None:
+        warnings = ""
+        state = "لم تُرفع صورة"
+        metrics = "لم يُجرَ فحص تقني للصورة"
+    else:
+        warnings = "".join("<li>" + escape(x) + "</li>" for x in quality["warnings"])
+        state = "استوفت العتبات التقنية" if quality["ok"] else "تحتاج إعادة تصوير"
+        metrics = f"الإضاءة: {quality['brightness']}/255 | مؤشر الحدة: {quality['sharpness']}"
     return f"""<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <title>تقرير فاحص التجريبي</title><style>
 body{{font-family:Tahoma,Arial,sans-serif;max-width:800px;margin:32px auto;color:#192b3b;line-height:1.8;padding:0 18px}}
@@ -117,7 +129,7 @@ h1{{color:#126079}}.note{{border-right:4px solid #c67b00;background:#fff7ed;padd
 <p><b>التوصية:</b> {escape(result['action'])}</p></div>
 <h2>المعلومات المُبلّغ عنها</h2><ul>{reasons}</ul>
 <h2>جودة الصورة التقنية (تجريبية)</h2>
-<p>{state} | الإضاءة: {quality['brightness']}/255 | مؤشر الحدة: {quality['sharpness']}</p>
+<p>{state} | {metrics}</p>
 <ul>{warnings}</ul>
 <h2>حدود التحليل</h2><p>{escape(result['image_note'])}</p>
 <p>الصورة لا تُدرج داخل التقرير. لا تمثل النتيجة إحالة صادرة عن منشأة صحية.</p>
@@ -232,7 +244,7 @@ with st.expander("لماذا ظهرت هذه التوصية؟"):
         st.write("• " + reason)
     st.write("لا يُستنتج التشخيص أو درجة خطورة عددية من صورة العين في هذه النسخة.")
 
-if quality is not None and (age_string.strip() == "" or age is not None):
+if age_string.strip() == "" or age is not None:
     st.markdown("### ٤ — تنزيل التقرير والتكامل التجريبي")
     markdown = report_markdown(result, quality, age, selected_label)
     exported = build_triage_bundle(
@@ -258,7 +270,7 @@ if quality is not None and (age_string.strip() == "" or age is not None):
     )
     st.caption("لفظ «FHIR تجريبي» يعني صيغة تبادل معلومات أولية، ولا يُعد تقريرًا تشخيصيًا.")
 else:
-    st.caption("رفع صورة مستوفية للقراءة وبيانات صحيحة يتيح تنزيل تقرير النتائج التقنية والتوجيه.")
+    st.caption("صحّح العمر المدخل، أو اتركه فارغًا، لإتاحة تنزيل التقرير.")
 
 st.divider()
 with st.expander("عن النموذج الأولي وخارطة التحقق"):
