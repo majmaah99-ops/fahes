@@ -18,7 +18,7 @@ from triage import triage
 from triage_export import build_triage_bundle
 from web_ui import PAGE
 
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_PIXELS = 24_000_000
 SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP"}
 
@@ -41,7 +41,7 @@ def health():
 
 def _decode_image(raw: bytes) -> np.ndarray:
     if len(raw) > MAX_IMAGE_BYTES:
-        raise ValueError("حجم الصورة يتجاوز 10 ميجابايت.")
+        raise ValueError("حجم الصورة يتجاوز 4 ميجابايت. يُرجى ضغطها أو تصغيرها.")
     if not raw:
         raise ValueError("لم تُرسل صورة.")
     try:
